@@ -1,6 +1,6 @@
 "use client"
 
-import { useEffect, useMemo, useState } from "react"
+import { useEffect, useMemo, useRef, useState } from "react"
 import Image from "next/image"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -14,10 +14,12 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Separator } from "@/components/ui/separator"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { useToast } from "@/hooks/use-toast"
-import { BadgeCheck, ChevronDown, Dot, FileText, HelpCircle, ImageIcon, Laptop, Menu, Monitor, MousePointer, Plus, Search, Settings, Smartphone, Tablet, Type, Loader2, LinkIcon, RefreshCcw } from 'lucide-react'
+import { Progress } from "@/components/ui/progress"
+import { BadgeCheck, ChevronDown, Dot, FileText, HelpCircle, ImageIcon, Laptop, Menu, Monitor, MousePointer, Plus, Search, Settings, Smartphone, Tablet, Type, Loader2, LinkIcon, RefreshCcw, Square, Play } from 'lucide-react'
 import { cn } from "@/lib/utils"
 import type { SourceMeta } from "@/lib/idb"
 import { forceRefresh, listSources, loadFromCache, refreshIfExpired } from "@/lib/sitemap-cache"
+import { importLargeSitemapIndex, type ImportProgress } from "@/lib/large-index-importer"
 
 type Device = "desktop" | "tablet" | "mobile"
 
@@ -41,8 +43,7 @@ const initialPages: PageMeta[] = [
     path: "/",
     online: true,
     title: "Discover what's new",
-    description:
-      "Shop our latest arrivals and find something fresh and exciting for your home.",
+    description: "Shop our latest arrivals and find something fresh and exciting for your home.",
     exclude: false,
     canonicalUrl: "https://example.com/",
     priority: 0.75,
@@ -92,10 +93,14 @@ export default function Page() {
   const [activeSource, setActiveSource] = useState<SourceMeta | null>(null)
   const [sources, setSources] = useState<SourceMeta[]>([])
 
-  const selected = useMemo(
-    () => pages.find((p) => p.id === selectedPageId) ?? pages[0],
-    [pages, selectedPageId]
-  )
+  // Large index import progress
+  const [progress, setProgress] = useState<ImportProgress | null>(null)
+  const jobRef = useRef<{ cancel: () => void } | null>(null)
+
+  const selected = useMemo(() => pages.find((p) => p.id === selectedPageId) ?? pages[0], [
+    pages,
+    selectedPageId,
+  ])
 
   function updateSelected<K extends keyof PageMeta>(key: K, value: PageMeta[K]) {
     setPages((prev) => prev.map((p) => (p.id === selectedPageId ? { ...p, [key]: value } : p)))
@@ -152,7 +157,7 @@ export default function Page() {
     })
   }
 
-  async function refresh(url: string, silent = false) {
+  async function refreshSimple(url: string, silent = false) {
     setIsImporting(true)
     try {
       const res = await forceRefresh(url)
@@ -160,23 +165,16 @@ export default function Page() {
       mergeSampleIntoUI(res.sample)
       setSources(await listSources())
       if (!silent) {
-        toast({
-          title: "Sitemap refreshed",
-          description: `Cached ${res.total.toLocaleString()} URLs.`,
-        })
+        toast({ title: "Sitemap refreshed", description: `Cached ${res.total.toLocaleString()} URLs.` })
       }
     } catch (err: any) {
-      toast({
-        title: "Refresh failed",
-        description: err.message ?? "Unknown error",
-        variant: "destructive",
-      })
+      toast({ title: "Refresh failed", description: err.message ?? "Unknown error", variant: "destructive" })
     } finally {
       setIsImporting(false)
     }
   }
 
-  // On mount: load sources and try to show cached sample for the current URL, then silently refresh if expired
+  // On mount: show cached sample and silently refresh if expired
   useEffect(() => {
     let cancelled = false
     ;(async () => {
@@ -205,13 +203,63 @@ export default function Page() {
     }
   }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
-  async function handleImportFromSitemap(e?: React.FormEvent) {
-    e?.preventDefault()
-    await refresh(importUrl)
+  async function startImport(url: string) {
+    setIsImporting(true)
+    setProgress(null)
+    // Use the large importer which handles both urlset and index.
+    const job = importLargeSitemapIndex(
+      url,
+      {
+        onStart: (p) => setProgress(p),
+        onProgress: (p) => setProgress(p),
+        onBatch: (batch) => {
+          // Merge a tiny sample to keep the UI engaging without flooding
+          mergeSampleIntoUI(batch.slice(0, 20))
+        },
+        onComplete: async (finalCount) => {
+          setIsImporting(false)
+          setProgress((prev) => (prev ? { ...prev } : prev))
+          setActiveSource({
+            url,
+            lastFetched: Date.now(),
+            expiresAt: Date.now() + 1000 * 60 * 60 * 6,
+            total: finalCount,
+          })
+          setSources(await listSources())
+          toast({
+            title: "Import complete",
+            description: `Cached ${finalCount.toLocaleString()} URLs.`,
+          })
+          jobRef.current = null
+        },
+        onError: (err) => {
+          setIsImporting(false)
+          toast({ title: "Import failed", description: err.message ?? "Unknown error", variant: "destructive" })
+          jobRef.current = null
+        },
+      },
+      {
+        // You can tune these for bigger indexes or slower servers
+        groupSize: 20,
+        concurrency: 4,
+      }
+    )
+    jobRef.current = { cancel: job.cancel }
+    await job.promise
   }
 
-  const activeIsExpired =
-    activeSource && Date.now() > (activeSource.expiresAt || 0)
+  async function handleImportFromSitemap(e?: React.FormEvent) {
+    e?.preventDefault()
+    await startImport(importUrl)
+  }
+
+  const activeIsExpired = activeSource && Date.now() > (activeSource.expiresAt || 0)
+  const pct =
+    progress && progress.totalSitemaps > 0
+      ? Math.min(100, Math.round((progress.processedSitemaps / progress.totalSitemaps) * 100))
+      : progress
+      ? 0
+      : undefined
 
   return (
     <div className="flex h-dvh w-full bg-background text-foreground">
@@ -247,7 +295,7 @@ export default function Page() {
               </Button>
             </div>
 
-            {/* Import + Refresh with cache info */}
+            {/* Import + Refresh with progress */}
             <form onSubmit={handleImportFromSitemap} className="mt-4 rounded-lg border p-4 space-y-3">
               <div className="flex items-center gap-2">
                 <LinkIcon className="h-4 w-4 text-muted-foreground" />
@@ -262,47 +310,90 @@ export default function Page() {
                   onChange={(e) => setImportUrl(e.target.value)}
                   placeholder="https://example.com/sitemap.xml"
                   className="w-full"
+                  disabled={isImporting && !!progress}
                 />
-                <Button type="submit" disabled={isImporting} className="w-full sm:w-auto">
-                  {isImporting ? (
-                    <>
-                      <Loader2 className="mr-2 h-4 w-4 animate-spin" /> Import
-                    </>
-                  ) : (
-                    "Import"
-                  )}
-                </Button>
-                <Button
-                  type="button"
-                  variant="outline"
-                  onClick={() => refresh(importUrl)}
-                  disabled={isImporting}
-                  className="w-full sm:w-auto"
-                >
-                  <RefreshCcw className="mr-2 h-4 w-4" />
-                  Refresh
-                </Button>
-              </div>
-
-              {activeSource && activeSource.url === importUrl && (
-                <div className="text-xs text-muted-foreground flex flex-wrap items-center gap-x-4 gap-y-1 pt-1">
-                  <span>
-                    Cached: <span className="font-medium">{activeSource.total.toLocaleString()}</span> URLs
-                  </span>
-                  <span>Last sync: {new Date(activeSource.lastFetched).toLocaleString()}</span>
-                  <span
-                    className={cn(
-                      "rounded px-1 py-0.5",
-                      activeIsExpired ? "bg-amber-100 text-amber-700" : "bg-emerald-100 text-emerald-700"
+                <div className="grid grid-cols-2 gap-2">
+                  <Button type="submit" disabled={isImporting} className="w-full">
+                    {isImporting ? (
+                      <>
+                        <Loader2 className="mr-2 h-4 w-4 animate-spin" /> Import
+                      </>
+                    ) : (
+                      <>
+                        <Play className="mr-2 h-4 w-4" /> Import
+                      </>
                     )}
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    onClick={() => refreshSimple(importUrl)}
+                    disabled={isImporting}
+                    className="w-full"
                   >
-                    {activeIsExpired ? "Expired" : "Fresh"}
-                  </span>
+                    <RefreshCcw className="mr-2 h-4 w-4" />
+                    Refresh cache
+                  </Button>
                 </div>
-              )}
+
+                {/* Progressive job UI */}
+                {progress && (
+                  <div className="space-y-2 rounded-md border p-3">
+                    <div className="flex items-center justify-between text-xs">
+                      <span>
+                        Sitemaps {progress.processedSitemaps.toLocaleString()}/
+                        {progress.totalSitemaps.toLocaleString()}
+                      </span>
+                      <span>URLs imported {progress.urlsImported.toLocaleString()}</span>
+                    </div>
+                    <Progress value={pct} />
+                    <div className="flex items-center justify-between">
+                      <div className="text-xs text-muted-foreground">
+                        {pct !== undefined ? `${pct}%` : "Starting…"}
+                      </div>
+                      <div className="flex gap-2">
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          onClick={() => {
+                            jobRef.current?.cancel()
+                            setIsImporting(false)
+                            setProgress(null)
+                            toast({
+                              title: "Import canceled",
+                              description: "You can resume by clicking Import again.",
+                            })
+                          }}
+                        >
+                          <Square className="mr-2 h-3.5 w-3.5" />
+                          Cancel
+                        </Button>
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                {activeSource && activeSource.url === importUrl && (
+                  <div className="text-xs text-muted-foreground flex flex-wrap items-center gap-x-4 gap-y-1 pt-1">
+                    <span>
+                      Cached: <span className="font-medium">{activeSource.total.toLocaleString()}</span> URLs
+                    </span>
+                    <span>Last sync: {new Date(activeSource.lastFetched).toLocaleString()}</span>
+                    <span
+                      className={cn(
+                        "rounded px-1 py-0.5",
+                        activeIsExpired ? "bg-amber-100 text-amber-700" : "bg-emerald-100 text-emerald-700"
+                      )}
+                    >
+                      {activeIsExpired ? "Expired" : "Fresh"}
+                    </span>
+                  </div>
+                )}
+              </div>
             </form>
 
-            <ScrollArea className="mt-4 h-[calc(100dvh-380px)]">
+            <ScrollArea className="mt-4 h-[calc(100dvh-430px)]">
               <ul className="space-y-1">
                 {pages.map((p) => (
                   <li key={p.id}>
@@ -328,7 +419,7 @@ export default function Page() {
               </ul>
             </ScrollArea>
 
-            {/* Known sources list for convenience */}
+            {/* Known sources list */}
             {sources.length > 0 && (
               <div className="mt-3 rounded-md border p-2">
                 <div className="text-xs font-medium mb-1">Known sitemaps</div>
@@ -369,7 +460,9 @@ export default function Page() {
           </TabsContent>
 
           <TabsContent value="elements" className="px-3">
-            <p className="text-sm text-muted-foreground">Drag components like Text, Image, Button, and Grid from here (demo).</p>
+            <p className="text-sm text-muted-foreground">
+              Drag components like Text, Image, Button, and Grid from here (demo).
+            </p>
             <div className="mt-2 grid grid-cols-2 gap-2">
               <div className="rounded-md border p-3 text-sm flex items-center gap-2">
                 <Type className="h-4 w-4" /> Heading
@@ -396,7 +489,9 @@ export default function Page() {
             <span className="sr-only">Select</span>
           </Button>
           <div className="flex items-center gap-2 min-w-0 flex-1">
-            <Badge variant="secondary" className="hidden sm:inline-flex">en</Badge>
+            <Badge variant="secondary" className="hidden sm:inline-flex">
+              en
+            </Badge>
             <div className="relative flex-1 min-w-0">
               <Input
                 className="pl-8"
@@ -411,16 +506,33 @@ export default function Page() {
                 <SelectValue placeholder="Device" />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value="desktop"><div className="flex items-center gap-2"><Laptop className="h-4 w-4" /> Desktop</div></SelectItem>
-                <SelectItem value="tablet"><div className="flex items-center gap-2"><Tablet className="h-4 w-4" /> Tablet</div></SelectItem>
-                <SelectItem value="mobile"><div className="flex items-center gap-2"><Smartphone className="h-4 w-4" /> Mobile</div></SelectItem>
+                <SelectItem value="desktop">
+                  <div className="flex items-center gap-2">
+                    <Laptop className="h-4 w-4" /> Desktop
+                  </div>
+                </SelectItem>
+                <SelectItem value="tablet">
+                  <div className="flex items-center gap-2">
+                    <Tablet className="h-4 w-4" /> Tablet
+                  </div>
+                </SelectItem>
+                <SelectItem value="mobile">
+                  <div className="flex items-center gap-2">
+                    <Smartphone className="h-4 w-4" /> Mobile
+                  </div>
+                </SelectItem>
               </SelectContent>
             </Select>
           </div>
           <div className="flex items-center gap-2">
             <Button variant="secondary">Preview</Button>
             <Button className="bg-emerald-600 hover:bg-emerald-700">Publish</Button>
-            <Button variant="ghost" size="icon" className="h-8 w-8" onClick={() => setShowReference((s) => !s)}>
+            <Button
+              variant="ghost"
+              size="icon"
+              className="h-8 w-8"
+              onClick={() => setShowReference((s) => !s)}
+            >
               <ImageIcon className="h-4 w-4" />
               <span className="sr-only">Toggle reference</span>
             </Button>
@@ -465,7 +577,9 @@ export default function Page() {
             <div className="mx-auto max-w-6xl p-3">
               <div className="mb-2 flex items-center justify-between">
                 <div className="text-sm font-medium">Reference screenshot</div>
-                <Button size="sm" variant="ghost" onClick={() => setShowReference(false)}>Hide</Button>
+                <Button size="sm" variant="ghost" onClick={() => setShowReference(false)}>
+                  Hide
+                </Button>
               </div>
               <div className="overflow-hidden rounded-md border">
                 <Image
