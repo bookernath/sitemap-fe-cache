@@ -4,10 +4,7 @@ import { useEffect, useMemo, useRef, useState } from "react"
 import Image from "next/image"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
-import { Textarea } from "@/components/ui/textarea"
-import { Switch } from "@/components/ui/switch"
 import { Label } from "@/components/ui/label"
-import { Checkbox } from "@/components/ui/checkbox"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Badge } from "@/components/ui/badge"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
@@ -848,196 +845,100 @@ export default function Page() {
         </div>
       </main>
 
-      {/* Right sidebar with Metadata + Telemetry tabs */}
+      {/* Right sidebar - Telemetry only */}
       <aside className="w-full max-w-sm shrink-0 border-l hidden lg:flex">
         <ScrollArea className="h-dvh w-full">
           <div className="p-4 space-y-4">
-            <Tabs defaultValue="meta">
-              <TabsList className="grid grid-cols-2">
-                <TabsTrigger value="meta">Metadata</TabsTrigger>
-                <TabsTrigger value="telemetry">Telemetry</TabsTrigger>
-              </TabsList>
+            <div className="space-y-4 mt-2">
+              <div className="flex items-center justify-between">
+                <h2 className="text-sm font-semibold">Telemetry</h2>
+                <Button variant="destructive" size="sm" onClick={handleNuke}>
+                  <Trash2 className="mr-2 h-4 w-4" />
+                  Nuke DB
+                </Button>
+              </div>
+              <Separator />
 
-              <TabsContent value="meta">
-                <div className="space-y-4 mt-2">
-                  <div className="flex items-center justify-between">
-                    <h2 className="text-sm font-semibold">Metadata</h2>
-                    <div className="flex items-center gap-2">
-                      <span className="text-xs text-muted-foreground">Online</span>
-                      <Switch
-                        checked={selected?.online || false}
-                        onCheckedChange={(v) => updateSelected("online", v)}
-                        aria-label="Online"
-                      />
-                    </div>
+              <div className="grid grid-cols-2 gap-3">
+                <Card>
+                  <CardHeader className="py-3">
+                    <CardTitle className="text-xs font-medium flex items-center gap-1">
+                      <Database className="h-4 w-4" /> IDB Usage
+                    </CardTitle>
+                  </CardHeader>
+                  <CardContent className="pb-3">
+                    <div className="text-lg font-semibold">{formatBytes(dbUsage.indexedDB || dbUsage.usage)}</div>
+                    <div className="text-xs text-muted-foreground">of {formatBytes(dbUsage.quota)} quota</div>
+                  </CardContent>
+                </Card>
+                <Card>
+                  <CardHeader className="py-3">
+                    <CardTitle className="text-xs font-medium flex items-center gap-1">
+                      <Cpu className="h-4 w-4" /> Pages Cached
+                    </CardTitle>
+                  </CardHeader>
+                  <CardContent className="pb-3">
+                    <div className="text-lg font-semibold">{pagesCount.toLocaleString()}</div>
+                    <div className="text-xs text-muted-foreground">{sources.length} sources</div>
+                  </CardContent>
+                </Card>
+                <Card>
+                  <CardHeader className="py-3">
+                    <CardTitle className="text-xs font-medium flex items-center gap-1">
+                      <Network className="h-4 w-4" /> Network (Page)
+                    </CardTitle>
+                  </CardHeader>
+                  <CardContent className="pb-3">
+                    <div className="text-lg font-semibold">{formatBytes(perfTotals.bytes)}</div>
+                    <div className="text-xs text-muted-foreground">{perfTotals.requests} requests</div>
+                  </CardContent>
+                </Card>
+                <Card>
+                  <CardHeader className="py-3">
+                    <CardTitle className="text-xs font-medium flex items-center gap-1">
+                      <Activity className="h-4 w-4" /> Worker
+                    </CardTitle>
+                  </CardHeader>
+                  <CardContent className="pb-3">
+                    <div className="text-lg font-semibold">{formatBytes(workerNet.bytes)}</div>
+                    <div className="text-xs text-muted-foreground">{workerNet.requests} requests</div>
+                  </CardContent>
+                </Card>
+              </div>
+
+              <Card>
+                <CardHeader className="py-3">
+                  <CardTitle className="text-xs font-medium">Cumulative Transfer (Page) Sparkline</CardTitle>
+                </CardHeader>
+                <CardContent className="pb-3">
+                  <Sparkline data={netSeries} />
+                  <div className="mt-2 text-xs text-muted-foreground">
+                    Combined: {formatBytes(combinedNetBytes)} across {combinedRequests} requests
                   </div>
-                  <Separator />
-                  <div className="space-y-3">
-                    <div className="grid gap-2">
-                      <Label htmlFor="path">Path</Label>
-                      <Input
-                        id="path"
-                        value={selected?.path || ""}
-                        onChange={(e) => updateSelected("path", e.target.value)}
-                        placeholder="/"
-                      />
-                    </div>
-                    <div className="grid gap-2">
-                      <Label htmlFor="title">Title</Label>
-                      <Input
-                        id="title"
-                        value={selected?.title || ""}
-                        onChange={(e) => updateSelected("title", e.target.value)}
-                        placeholder="Page title"
-                      />
-                    </div>
-                    <div className="grid gap-2">
-                      <Label htmlFor="desc">Description</Label>
-                      <Textarea
-                        id="desc"
-                        value={selected?.description || ""}
-                        onChange={(e) => updateSelected("description", e.target.value)}
-                        placeholder="Describe this page..."
-                        rows={5}
-                      />
-                    </div>
-                    <div className="grid gap-2">
-                      <Label>Social Image</Label>
-                      <div className="flex items-center gap-3">
-                        <div className="h-16 w-16 rounded-md border bg-muted" aria-hidden="true" />
-                        <Button variant="outline" size="sm">Choose</Button>
-                      </div>
-                    </div>
-                    <div className="flex items-center space-x-2">
-                      <Checkbox
-                        id="exclude"
-                        checked={selected?.exclude || false}
-                        onCheckedChange={(v) => updateSelected("exclude", Boolean(v))}
-                      />
-                      <Label htmlFor="exclude">Exclude from search engines</Label>
-                    </div>
-                    <div className="grid gap-2">
-                      <Label htmlFor="canonical">Canonical URL</Label>
-                      <Input
-                        id="canonical"
-                        value={selected?.canonicalUrl || ""}
-                        onChange={(e) => updateSelected("canonicalUrl", e.target.value)}
-                        placeholder="https://example.com/path"
-                      />
-                    </div>
-                    <div className="grid gap-2">
-                      <Label htmlFor="priority">Sitemap priority</Label>
-                      <div className="flex items-center gap-3">
-                        <input
-                          id="priority"
-                          type="range"
-                          min={0}
-                          max={1}
-                          step={0.05}
-                          value={selected?.priority ?? 0.5}
-                          onChange={(e) => updateSelected("priority", Number(e.target.value))}
-                          className="w-full"
-                        />
-                        <Badge variant="secondary">{(selected?.priority ?? 0.5).toFixed(2)}</Badge>
-                      </div>
-                    </div>
-                  </div>
-                </div>
-              </TabsContent>
+                </CardContent>
+              </Card>
 
-              <TabsContent value="telemetry">
-                <div className="space-y-4 mt-2">
-                  <div className="flex items-center justify-between">
-                    <h2 className="text-sm font-semibold">Telemetry</h2>
-                    <Button variant="destructive" size="sm" onClick={handleNuke}>
-                      <Trash2 className="mr-2 h-4 w-4" />
-                      Nuke DB
-                    </Button>
-                  </div>
-                  <Separator />
-
-                  <div className="grid grid-cols-2 gap-3">
-                    <Card>
-                      <CardHeader className="py-3">
-                        <CardTitle className="text-xs font-medium flex items-center gap-1">
-                          <Database className="h-4 w-4" /> IDB Usage
-                        </CardTitle>
-                      </CardHeader>
-                      <CardContent className="pb-3">
-                        <div className="text-lg font-semibold">{formatBytes(dbUsage.indexedDB || dbUsage.usage)}</div>
-                        <div className="text-xs text-muted-foreground">of {formatBytes(dbUsage.quota)} quota</div>
-                      </CardContent>
-                    </Card>
-                    <Card>
-                      <CardHeader className="py-3">
-                        <CardTitle className="text-xs font-medium flex items-center gap-1">
-                          <Cpu className="h-4 w-4" /> Pages Cached
-                        </CardTitle>
-                      </CardHeader>
-                      <CardContent className="pb-3">
-                        <div className="text-lg font-semibold">{pagesCount.toLocaleString()}</div>
-                        <div className="text-xs text-muted-foreground">{sources.length} sources</div>
-                      </CardContent>
-                    </Card>
-                    <Card>
-                      <CardHeader className="py-3">
-                        <CardTitle className="text-xs font-medium flex items-center gap-1">
-                          <Network className="h-4 w-4" /> Network (Page)
-                        </CardTitle>
-                      </CardHeader>
-                      <CardContent className="pb-3">
-                        <div className="text-lg font-semibold">{formatBytes(perfTotals.bytes)}</div>
-                        <div className="text-xs text-muted-foreground">{perfTotals.requests} requests</div>
-                      </CardContent>
-                    </Card>
-                    <Card>
-                      <CardHeader className="py-3">
-                        <CardTitle className="text-xs font-medium flex items-center gap-1">
-                          <Activity className="h-4 w-4" /> Worker
-                        </CardTitle>
-                      </CardHeader>
-                      <CardContent className="pb-3">
-                        <div className="text-lg font-semibold">{formatBytes(workerNet.bytes)}</div>
-                        <div className="text-xs text-muted-foreground">{workerNet.requests} requests</div>
-                      </CardContent>
-                    </Card>
-                  </div>
-
-                  <Card>
-                    <CardHeader className="py-3">
-                      <CardTitle className="text-xs font-medium">Cumulative Transfer (Page) Sparkline</CardTitle>
-                    </CardHeader>
-                    <CardContent className="pb-3">
-                      <Sparkline data={netSeries} />
-                      <div className="mt-2 text-xs text-muted-foreground">
-                        Combined: {formatBytes(combinedNetBytes)} across {combinedRequests} requests
-                      </div>
-                    </CardContent>
-                  </Card>
-
-                  <Card>
-                    <CardHeader className="py-3">
-                      <CardTitle className="text-xs font-medium">Requests by type</CardTitle>
-                    </CardHeader>
-                    <CardContent className="pb-3">
-                      <ul className="grid grid-cols-2 gap-1 text-xs">
-                        {Object.entries(perfBreakdown)
-                          .sort((a, b) => b[1] - a[1])
-                          .map(([k, v]) => (
-                            <li key={k} className="flex items-center justify-between">
-                              <span className="capitalize">{k || "other"}</span>
-                              <span className="text-muted-foreground">{v}</span>
-                            </li>
-                          ))}
-                        {Object.keys(perfBreakdown).length === 0 && (
-                          <li className="text-muted-foreground">No resource timing data yet.</li>
-                        )}
-                      </ul>
-                    </CardContent>
-                  </Card>
-                </div>
-              </TabsContent>
-            </Tabs>
+              <Card>
+                <CardHeader className="py-3">
+                  <CardTitle className="text-xs font-medium">Requests by type</CardTitle>
+                </CardHeader>
+                <CardContent className="pb-3">
+                  <ul className="grid grid-cols-2 gap-1 text-xs">
+                    {Object.entries(perfBreakdown)
+                      .sort((a, b) => b[1] - a[1])
+                      .map(([k, v]) => (
+                        <li key={k} className="flex items-center justify-between">
+                          <span className="capitalize">{k || "other"}</span>
+                          <span className="text-muted-foreground">{v}</span>
+                        </li>
+                      ))}
+                    {Object.keys(perfBreakdown).length === 0 && (
+                      <li className="text-muted-foreground">No resource timing data yet.</li>
+                    )}
+                  </ul>
+                </CardContent>
+              </Card>
+            </div>
           </div>
         </ScrollArea>
       </aside>
