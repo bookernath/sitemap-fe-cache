@@ -19,7 +19,7 @@ import { BadgeCheck, ChevronDown, Dot, FileText, HelpCircle, ImageIcon, Laptop, 
 import { cn } from "@/lib/utils"
 import type { SourceMeta } from "@/lib/idb"
 import { forceRefresh, listSources, loadFromCache, refreshIfExpired } from "@/lib/sitemap-cache"
-import { searchByPathPrefix, type PageRecord } from "@/lib/idb"
+import { ensureBackfillPathsOnce, searchFuzzy, type PageRecord } from "@/lib/idb"
 import type { ImportProgress, WorkerToMain } from "@/lib/import-types"
 
 type Device = "desktop" | "tablet" | "mobile"
@@ -77,15 +77,6 @@ function prettyNameFromPath(pathname: string): string {
   if (pathname === "/" || pathname === "") return "Home"
   const last = pathname.split("/").filter(Boolean).pop() || "page"
   return decodeURIComponent(last).replace(/[-_]+/g, " ").replace(/\b\w/g, (c) => c.toUpperCase())
-}
-
-function useDebounced<T>(value: T, delay = 250) {
-  const [v, setV] = useState(value)
-  useEffect(() => {
-    const t = setTimeout(() => setV(value), delay)
-    return () => clearTimeout(t)
-  }, [value, delay])
-  return v
 }
 
 export default function Page() {
@@ -178,8 +169,16 @@ export default function Page() {
   }
 
   function ensurePageFromRecord(rec: PageRecord) {
+    const effectivePath = rec.path || (() => {
+      try {
+        const u = new URL(rec.loc)
+        return u.pathname || "/"
+      } catch {
+        return rec.loc.startsWith("/") ? rec.loc : `/${rec.loc}`
+      }
+    })()
     setPages((prev) => {
-      const found = prev.find((p) => p.path === rec.path)
+      const found = prev.find((p) => p.path === effectivePath)
       if (found) {
         setSelectedPageId(found.id)
         return prev
@@ -187,10 +186,10 @@ export default function Page() {
       const id = Math.random().toString(36).slice(2, 10)
       const next: PageMeta = {
         id,
-        name: prettyNameFromPath(rec.path),
-        path: rec.path,
+        name: prettyNameFromPath(effectivePath),
+        path: effectivePath,
         online: true,
-        title: prettyNameFromPath(rec.path),
+        title: prettyNameFromPath(effectivePath),
         description: "",
         exclude: false,
         canonicalUrl: rec.loc,
@@ -201,6 +200,13 @@ export default function Page() {
       return [...prev, next]
     })
   }
+
+  // One-time: ensure backfill of path/path_lc so searches work on old data.
+  useEffect(() => {
+    ;(async () => {
+      await ensureBackfillPathsOnce()
+    })()
+  }, [])
 
   // Cached-first, then silent refresh if expired
   useEffect(() => {
@@ -231,20 +237,19 @@ export default function Page() {
     }
   }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Sidebar search effect (IDB-only)
+  // Sidebar live search (IDB-only, fuzzy)
   useEffect(() => {
     let active = true
-    const q = sidebarQuery.trim()
     const token = ++sidebarSearchToken.current
     ;(async () => {
+      const q = sidebarQuery.trim()
       if (!q) {
         if (active) setSidebarResults(null)
         return
       }
       try {
-        const results = await searchByPathPrefix(q.startsWith("/") ? q : `/${q}`, 10)
-        if (!active) return
-        if (sidebarSearchToken.current !== token) return
+        const results = await searchFuzzy(q, 10)
+        if (!active || sidebarSearchToken.current !== token) return
         setSidebarResults(results)
       } catch {
         if (active) setSidebarResults([])
@@ -255,13 +260,13 @@ export default function Page() {
     }
   }, [sidebarQuery])
 
-  // Omnibar quicksearch effect
+  // Omnibar quicksearch (across all sources, fuzzy for relative paths)
   useEffect(() => {
-    const q = omnibarInput
-    const token = ++omniSearchToken.current
     let mounted = true
+    const token = ++omniSearchToken.current
     ;(async () => {
-      const looksLikePath = q.trim().startsWith("/")
+      const q = omnibarInput
+      const looksLikePath = q.trim().startsWith("/") || !q.includes("://")
       if (!looksLikePath) {
         if (mounted) {
           setOmniResults([])
@@ -269,11 +274,10 @@ export default function Page() {
         }
         return
       }
-      const results = await searchByPathPrefix(q.trim(), 10)
-      if (!mounted) return
-      if (omniSearchToken.current !== token) return
+      const results = await searchFuzzy(q.trim(), 10)
+      if (!mounted || omniSearchToken.current !== token) return
       setOmniResults(results)
-      setShowOmniResults(true)
+      setShowOmniResults(results.length > 0)
     })()
     return () => {
       mounted = false
@@ -282,7 +286,6 @@ export default function Page() {
 
   function getWorker(): Worker {
     if (workerRef.current) return workerRef.current
-    // Use module worker so we can import dependencies
     const w = new Worker(new URL("../workers/import-worker.ts", import.meta.url), { type: "module" })
     w.onmessage = (e: MessageEvent<WorkerToMain>) => {
       const msg = e.data
@@ -304,7 +307,6 @@ export default function Page() {
         })
         ;(async () => setSources(await listSources()))()
         toast({ title: "Import complete", description: `Cached ${msg.total.toLocaleString()} URLs.` })
-        // Keep the worker for future jobs.
       } else if (msg.type === "error") {
         setIsImporting(false)
         setProgress(null)
@@ -333,7 +335,6 @@ export default function Page() {
   }
 
   async function refreshSimple(url: string, silent = false) {
-    // Fallback refresh via server action; small jobs handled on main thread
     setIsImporting(true)
     try {
       const res = await forceRefresh(url)
@@ -404,7 +405,7 @@ export default function Page() {
                   value={sidebarQuery}
                   onChange={(e) => setSidebarQuery(e.target.value)}
                   className="pl-8"
-                  placeholder="Search cached URLs (/products, /blog...)"
+                  placeholder="Search cached URLs (/products, /blog... or try 'product')"
                 />
               </div>
               <Button size="icon" onClick={addPage}>
@@ -500,7 +501,7 @@ export default function Page() {
               {sidebarResults ? (
                 <div className="space-y-2">
                   <div className="px-1 text-xs text-muted-foreground">
-                    Top 10 results ({sidebarResults.length})
+                    Top {Math.min(10, sidebarResults.length)} results
                   </div>
                   <ul className="space-y-1">
                     {sidebarResults.map((r) => (
@@ -621,18 +622,20 @@ export default function Page() {
                 onChange={(e) => {
                   const v = e.target.value
                   setOmnibarInput(v)
-                  if (!v.startsWith("/")) {
+                  // If it's a full URL, keep canonicalUrl in sync as you type.
+                  if (v.includes("://")) {
                     updateSelected("canonicalUrl", v)
                   }
                 }}
                 aria-label="Omnibar"
                 onFocus={() => {
-                  if (omnibarInput.trim().startsWith("/")) setShowOmniResults(true)
+                  const v = omnibarInput.trim()
+                  if (v && (v.startsWith("/") || !v.includes("://"))) setShowOmniResults(true)
                 }}
                 onBlur={() => {
                   setTimeout(() => setShowOmniResults(false), 150)
                 }}
-                placeholder="Paste a full URL or type /path to quicksearch"
+                placeholder="Paste a full URL or type /path (or 'products') to quicksearch"
               />
               <Monitor className="absolute left-2 top-2.5 h-4 w-4 text-muted-foreground" />
 
@@ -704,7 +707,11 @@ export default function Page() {
         <div className="relative flex-1 overflow-auto">
           <div className="mx-auto my-6 px-4">
             <Canvas device={device}>
-              <Hero title={selected?.title || ""} description={selected?.description || ""} online={selected?.online || false} />
+              <Hero
+                title={selected?.title || ""}
+                description={selected?.description || ""}
+                online={selected?.online || false}
+              />
             </Canvas>
           </div>
 
