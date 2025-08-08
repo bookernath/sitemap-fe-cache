@@ -31,6 +31,7 @@ const parser = new XMLParser({
 
 let cancelled = false
 const aborters = new Set<AbortController>()
+const workerNet = { requests: 0, bytes: 0 }
 
 function chunk<T>(arr: T[], size: number): T[][] {
   const out: T[][] = []
@@ -39,15 +40,24 @@ function chunk<T>(arr: T[], size: number): T[][] {
 }
 
 async function fetchJSON(path: string, body: any, signal?: AbortSignal) {
+  workerNet.requests++
   const res = await fetch(path, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
     signal,
   })
+  // Clone-free approximation: parse then compute size from JSON string
   const data = await res.json()
+  try {
+    const approxBytes = JSON.stringify(data).length
+    workerNet.bytes += approxBytes
+    postMessage({ type: "telemetry", net: { ...workerNet } } satisfies WorkerToMain)
+  } catch {
+    // ignore serialization errors
+  }
   if (!res.ok) {
-    throw new Error(data?.error || `Request failed: ${res.status}`)
+    throw new Error((data as any)?.error || `Request failed: ${res.status}`)
   }
   return data
 }
@@ -56,7 +66,6 @@ async function analyze(url: string) {
   const controller = new AbortController()
   aborters.add(controller)
   try {
-    // Uses server route to avoid cross-origin CORS issues and heavy XML parsing in the client.
     const info = await fetchJSON("/api/sitemap/index", { url }, controller.signal)
     return info
   } finally {
@@ -74,7 +83,6 @@ async function processGroup(
   const controller = new AbortController()
   aborters.add(controller)
   try {
-    // Server batches parsing of many child sitemaps.
     const { urls } = await fetchJSON("/api/sitemap/urls", { sitemaps: group }, controller.signal)
     const records: Omit<PageRecord, "path">[] = (urls as { loc: string; lastmod?: string }[]).map(
       (u) => ({ loc: u.loc, lastmod: u.lastmod, sourceUrl })
@@ -94,7 +102,6 @@ async function processGroup(
 }
 
 async function processUrlsetDirect(url: string, ttlMs: number) {
-  // For plain sitemaps, reuse existing /api/sitemap route for parsing.
   const controller = new AbortController()
   aborters.add(controller)
   try {
@@ -115,6 +122,7 @@ async function processUrlsetDirect(url: string, ttlMs: number) {
     })
     postMessage({ type: "batch", sample: urls.slice(0, DEFAULTS.samplePerBatch) } satisfies WorkerToMain)
     postMessage({ type: "complete", total } satisfies WorkerToMain)
+    postMessage({ type: "telemetry", net: { ...workerNet } } satisfies WorkerToMain)
   } finally {
     aborters.delete(controller)
   }
@@ -122,13 +130,14 @@ async function processUrlsetDirect(url: string, ttlMs: number) {
 
 async function run(payload: WorkerStartPayload) {
   cancelled = false
+  workerNet.requests = 0
+  workerNet.bytes = 0
   const { url, options } = payload
   const { groupSize, concurrency, ttlMs, samplePerBatch } = { ...DEFAULTS, ...options }
 
   try {
     const info = await analyze(url)
 
-    // urlset: single sitemap
     if (info?.type === "urlset") {
       const p: ImportProgress = {
         totalSitemaps: 1,
@@ -172,6 +181,7 @@ async function run(payload: WorkerStartPayload) {
       total,
     })
     postMessage({ type: "complete", total } satisfies WorkerToMain)
+    postMessage({ type: "telemetry", net: { ...workerNet } } satisfies WorkerToMain)
   } catch (err: any) {
     postMessage({ type: "error", message: err?.message || "Unknown error" } satisfies WorkerToMain)
   }

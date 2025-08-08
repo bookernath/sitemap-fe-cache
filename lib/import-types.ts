@@ -23,6 +23,7 @@ export type WorkerToMain =
   | { type: "batch"; sample: { loc: string; lastmod?: string }[] }
   | { type: "complete"; total: number }
   | { type: "error"; message: string }
+  | { type: "telemetry"; net: { requests: number; bytes: number } }
 
 export type MainToWorker =
   | { type: "start"; payload: WorkerStartPayload }

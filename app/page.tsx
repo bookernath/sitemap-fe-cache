@@ -15,11 +15,18 @@ import { Separator } from "@/components/ui/separator"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { useToast } from "@/hooks/use-toast"
 import { Progress } from "@/components/ui/progress"
-import { BadgeCheck, ChevronDown, Dot, FileText, HelpCircle, ImageIcon, Laptop, Menu, Monitor, MousePointer, Plus, Search, Settings, Smartphone, Tablet, Type, Loader2, LinkIcon, RefreshCcw, Square, Play } from 'lucide-react'
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
+import { BadgeCheck, ChevronDown, Dot, FileText, HelpCircle, ImageIcon, Laptop, Menu, Monitor, MousePointer, Plus, Search, Settings, Smartphone, Tablet, Type, Loader2, LinkIcon, RefreshCcw, Square, Play, Trash2, Activity, Cpu, Network, Database } from 'lucide-react'
 import { cn } from "@/lib/utils"
 import type { SourceMeta } from "@/lib/idb"
 import { forceRefresh, listSources, loadFromCache, refreshIfExpired } from "@/lib/sitemap-cache"
-import { ensureBackfillPathsOnce, searchFuzzy, type PageRecord } from "@/lib/idb"
+import {
+  ensureBackfillPathsOnce,
+  searchFuzzy,
+  countAllPages,
+  nukeDB,
+  type PageRecord,
+} from "@/lib/idb"
 import type { ImportProgress, WorkerToMain } from "@/lib/import-types"
 
 type Device = "desktop" | "tablet" | "mobile"
@@ -79,6 +86,18 @@ function prettyNameFromPath(pathname: string): string {
   return decodeURIComponent(last).replace(/[-_]+/g, " ").replace(/\b\w/g, (c) => c.toUpperCase())
 }
 
+function formatBytes(bytes?: number): string {
+  if (!bytes || bytes <= 0) return "0 B"
+  const units = ["B", "KB", "MB", "GB", "TB"]
+  let i = 0
+  let n = bytes
+  while (n >= 1024 && i < units.length - 1) {
+    n /= 1024
+    i++
+  }
+  return `${n.toFixed(i === 0 ? 0 : 2)} ${units[i]}`
+}
+
 export default function Page() {
   const { toast } = useToast()
   const [pages, setPages] = useState<PageMeta[]>(initialPages)
@@ -108,6 +127,14 @@ export default function Page() {
   const [omnibarInput, setOmnibarInput] = useState("")
   const [omniResults, setOmniResults] = useState<PageRecord[]>([])
   const [showOmniResults, setShowOmniResults] = useState(false)
+
+  // Telemetry state
+  const [dbUsage, setDbUsage] = useState<{ usage?: number; quota?: number; indexedDB?: number; caches?: number }>({})
+  const [pagesCount, setPagesCount] = useState<number>(0)
+  const [perfTotals, setPerfTotals] = useState<{ requests: number; bytes: number }>({ requests: 0, bytes: 0 })
+  const [perfBreakdown, setPerfBreakdown] = useState<Record<string, number>>({})
+  const [netSeries, setNetSeries] = useState<number[]>([])
+  const [workerNet, setWorkerNet] = useState<{ requests: number; bytes: number }>({ requests: 0, bytes: 0 })
 
   const selected = useMemo(() => pages.find((p) => p.id === selectedPageId) ?? pages[0], [
     pages,
@@ -284,8 +311,67 @@ export default function Page() {
     }
   }, [omnibarInput])
 
+  // Telemetry: DB usage (StorageManager), counts and Performance API sampling
+  useEffect(() => {
+    let mounted = true
+    async function sampleStorage() {
+      try {
+        const est: any = await (navigator as any).storage?.estimate?.()
+        if (!mounted || !est) return
+        setDbUsage({
+          usage: est.usage,
+          quota: est.quota,
+          indexedDB: est.usageDetails?.indexedDB,
+          caches: est.usageDetails?.caches,
+        })
+      } catch {
+        // ignore
+      }
+    }
+    async function sampleCounts() {
+      try {
+        const total = await countAllPages()
+        if (!mounted) return
+        setPagesCount(total)
+      } catch {
+        if (!mounted) return
+        setPagesCount(0)
+      }
+    }
+    function samplePerformance() {
+      const entries = performance.getEntriesByType("resource") as PerformanceResourceTiming[]
+      const totalRequests = entries.length
+      let totalBytes = 0
+      const byType: Record<string, number> = {}
+      for (const e of entries) {
+        const sz = (e.transferSize && e.transferSize > 0 ? e.transferSize : (e.encodedBodySize || 0))
+        totalBytes += sz
+        byType[e.initiatorType || "other"] = (byType[e.initiatorType || "other"] || 0) + 1
+      }
+      setPerfTotals({ requests: totalRequests, bytes: totalBytes })
+      setPerfBreakdown(byType)
+      setNetSeries((prev) => {
+        const next = [...prev, totalBytes]
+        return next.slice(-50)
+      })
+    }
+    sampleStorage()
+    sampleCounts()
+    samplePerformance()
+    const interval = setInterval(() => {
+      sampleStorage()
+      sampleCounts()
+      samplePerformance()
+    }, 3000)
+    return () => {
+      mounted = false
+      clearInterval(interval)
+    }
+  }, [])
+
   function getWorker(): Worker {
     if (workerRef.current) return workerRef.current
+    // Use module worker so we can import dependencies
     const w = new Worker(new URL("../workers/import-worker.ts", import.meta.url), { type: "module" })
     w.onmessage = (e: MessageEvent<WorkerToMain>) => {
       const msg = e.data
@@ -311,6 +397,8 @@ export default function Page() {
         setIsImporting(false)
         setProgress(null)
         toast({ title: "Import failed", description: msg.message, variant: "destructive" })
+      } else if (msg.type === "telemetry") {
+        setWorkerNet(msg.net)
       }
     }
     workerRef.current = w
@@ -335,6 +423,7 @@ export default function Page() {
   }
 
   async function refreshSimple(url: string, silent = false) {
+    // Fallback refresh via server action; small jobs handled on main thread
     setIsImporting(true)
     try {
       const res = await forceRefresh(url)
@@ -363,6 +452,31 @@ export default function Page() {
     await startImportWithWorker(importUrl)
   }
 
+  async function handleNuke() {
+    try {
+      workerRef.current?.postMessage({ type: "cancel" })
+      workerRef.current?.terminate()
+      workerRef.current = null
+    } catch {}
+    try {
+      await nukeDB()
+      localStorage.removeItem("idb:paths-backfilled:v3")
+      setPages(initialPages)
+      setSelectedPageId(initialPages[0].id)
+      setSources([])
+      setActiveSource(null)
+      setSidebarResults(null)
+      setWorkerNet({ requests: 0, bytes: 0 })
+      toast({ title: "Database cleared", description: "Reloading to apply a clean slate..." })
+    } catch (e: any) {
+      toast({ title: "Failed to clear DB", description: e?.message || "Unknown error", variant: "destructive" })
+    } finally {
+      setTimeout(() => {
+        window.location.reload()
+      }, 600)
+    }
+  }
+
   const activeIsExpired = activeSource && Date.now() > (activeSource.expiresAt || 0)
   const pct =
     progress && progress.totalSitemaps > 0
@@ -374,6 +488,9 @@ export default function Page() {
   useEffect(() => {
     setOmnibarInput(selected?.canonicalUrl || "")
   }, [selectedPageId])
+
+  const combinedNetBytes = (perfTotals.bytes || 0) + (workerNet.bytes || 0)
+  const combinedRequests = (perfTotals.requests || 0) + (workerNet.requests || 0)
 
   return (
     <div className="flex h-dvh w-full bg-background text-foreground">
@@ -622,7 +739,6 @@ export default function Page() {
                 onChange={(e) => {
                   const v = e.target.value
                   setOmnibarInput(v)
-                  // If it's a full URL, keep canonicalUrl in sync as you type.
                   if (v.includes("://")) {
                     updateSelected("canonicalUrl", v)
                   }
@@ -732,92 +848,196 @@ export default function Page() {
         </div>
       </main>
 
-      {/* Right sidebar */}
+      {/* Right sidebar with Metadata + Telemetry tabs */}
       <aside className="w-full max-w-sm shrink-0 border-l hidden lg:flex">
         <ScrollArea className="h-dvh w-full">
           <div className="p-4 space-y-4">
-            <div className="flex items-center justify-between">
-              <h2 className="text-sm font-semibold">Metadata</h2>
-              <div className="flex items-center gap-2">
-                <span className="text-xs text-muted-foreground">Online</span>
-                <Switch
-                  checked={selected?.online || false}
-                  onCheckedChange={(v) => updateSelected("online", v)}
-                  aria-label="Online"
-                />
-              </div>
-            </div>
-            <Separator />
-            <div className="space-y-3">
-              <div className="grid gap-2">
-                <Label htmlFor="path">Path</Label>
-                <Input
-                  id="path"
-                  value={selected?.path || ""}
-                  onChange={(e) => updateSelected("path", e.target.value)}
-                  placeholder="/"
-                />
-              </div>
-              <div className="grid gap-2">
-                <Label htmlFor="title">Title</Label>
-                <Input
-                  id="title"
-                  value={selected?.title || ""}
-                  onChange={(e) => updateSelected("title", e.target.value)}
-                  placeholder="Page title"
-                />
-              </div>
-              <div className="grid gap-2">
-                <Label htmlFor="desc">Description</Label>
-                <Textarea
-                  id="desc"
-                  value={selected?.description || ""}
-                  onChange={(e) => updateSelected("description", e.target.value)}
-                  placeholder="Describe this page..."
-                  rows={5}
-                />
-              </div>
-              <div className="grid gap-2">
-                <Label>Social Image</Label>
-                <div className="flex items-center gap-3">
-                  <div className="h-16 w-16 rounded-md border bg-muted" aria-hidden="true" />
-                  <Button variant="outline" size="sm">Choose</Button>
+            <Tabs defaultValue="meta">
+              <TabsList className="grid grid-cols-2">
+                <TabsTrigger value="meta">Metadata</TabsTrigger>
+                <TabsTrigger value="telemetry">Telemetry</TabsTrigger>
+              </TabsList>
+
+              <TabsContent value="meta">
+                <div className="space-y-4 mt-2">
+                  <div className="flex items-center justify-between">
+                    <h2 className="text-sm font-semibold">Metadata</h2>
+                    <div className="flex items-center gap-2">
+                      <span className="text-xs text-muted-foreground">Online</span>
+                      <Switch
+                        checked={selected?.online || false}
+                        onCheckedChange={(v) => updateSelected("online", v)}
+                        aria-label="Online"
+                      />
+                    </div>
+                  </div>
+                  <Separator />
+                  <div className="space-y-3">
+                    <div className="grid gap-2">
+                      <Label htmlFor="path">Path</Label>
+                      <Input
+                        id="path"
+                        value={selected?.path || ""}
+                        onChange={(e) => updateSelected("path", e.target.value)}
+                        placeholder="/"
+                      />
+                    </div>
+                    <div className="grid gap-2">
+                      <Label htmlFor="title">Title</Label>
+                      <Input
+                        id="title"
+                        value={selected?.title || ""}
+                        onChange={(e) => updateSelected("title", e.target.value)}
+                        placeholder="Page title"
+                      />
+                    </div>
+                    <div className="grid gap-2">
+                      <Label htmlFor="desc">Description</Label>
+                      <Textarea
+                        id="desc"
+                        value={selected?.description || ""}
+                        onChange={(e) => updateSelected("description", e.target.value)}
+                        placeholder="Describe this page..."
+                        rows={5}
+                      />
+                    </div>
+                    <div className="grid gap-2">
+                      <Label>Social Image</Label>
+                      <div className="flex items-center gap-3">
+                        <div className="h-16 w-16 rounded-md border bg-muted" aria-hidden="true" />
+                        <Button variant="outline" size="sm">Choose</Button>
+                      </div>
+                    </div>
+                    <div className="flex items-center space-x-2">
+                      <Checkbox
+                        id="exclude"
+                        checked={selected?.exclude || false}
+                        onCheckedChange={(v) => updateSelected("exclude", Boolean(v))}
+                      />
+                      <Label htmlFor="exclude">Exclude from search engines</Label>
+                    </div>
+                    <div className="grid gap-2">
+                      <Label htmlFor="canonical">Canonical URL</Label>
+                      <Input
+                        id="canonical"
+                        value={selected?.canonicalUrl || ""}
+                        onChange={(e) => updateSelected("canonicalUrl", e.target.value)}
+                        placeholder="https://example.com/path"
+                      />
+                    </div>
+                    <div className="grid gap-2">
+                      <Label htmlFor="priority">Sitemap priority</Label>
+                      <div className="flex items-center gap-3">
+                        <input
+                          id="priority"
+                          type="range"
+                          min={0}
+                          max={1}
+                          step={0.05}
+                          value={selected?.priority ?? 0.5}
+                          onChange={(e) => updateSelected("priority", Number(e.target.value))}
+                          className="w-full"
+                        />
+                        <Badge variant="secondary">{(selected?.priority ?? 0.5).toFixed(2)}</Badge>
+                      </div>
+                    </div>
+                  </div>
                 </div>
-              </div>
-              <div className="flex items-center space-x-2">
-                <Checkbox
-                  id="exclude"
-                  checked={selected?.exclude || false}
-                  onCheckedChange={(v) => updateSelected("exclude", Boolean(v))}
-                />
-                <Label htmlFor="exclude">Exclude from search engines</Label>
-              </div>
-              <div className="grid gap-2">
-                <Label htmlFor="canonical">Canonical URL</Label>
-                <Input
-                  id="canonical"
-                  value={selected?.canonicalUrl || ""}
-                  onChange={(e) => updateSelected("canonicalUrl", e.target.value)}
-                  placeholder="https://example.com/path"
-                />
-              </div>
-              <div className="grid gap-2">
-                <Label htmlFor="priority">Sitemap priority</Label>
-                <div className="flex items-center gap-3">
-                  <input
-                    id="priority"
-                    type="range"
-                    min={0}
-                    max={1}
-                    step={0.05}
-                    value={selected?.priority ?? 0.5}
-                    onChange={(e) => updateSelected("priority", Number(e.target.value))}
-                    className="w-full"
-                  />
-                  <Badge variant="secondary">{(selected?.priority ?? 0.5).toFixed(2)}</Badge>
+              </TabsContent>
+
+              <TabsContent value="telemetry">
+                <div className="space-y-4 mt-2">
+                  <div className="flex items-center justify-between">
+                    <h2 className="text-sm font-semibold">Telemetry</h2>
+                    <Button variant="destructive" size="sm" onClick={handleNuke}>
+                      <Trash2 className="mr-2 h-4 w-4" />
+                      Nuke DB
+                    </Button>
+                  </div>
+                  <Separator />
+
+                  <div className="grid grid-cols-2 gap-3">
+                    <Card>
+                      <CardHeader className="py-3">
+                        <CardTitle className="text-xs font-medium flex items-center gap-1">
+                          <Database className="h-4 w-4" /> IDB Usage
+                        </CardTitle>
+                      </CardHeader>
+                      <CardContent className="pb-3">
+                        <div className="text-lg font-semibold">{formatBytes(dbUsage.indexedDB || dbUsage.usage)}</div>
+                        <div className="text-xs text-muted-foreground">of {formatBytes(dbUsage.quota)} quota</div>
+                      </CardContent>
+                    </Card>
+                    <Card>
+                      <CardHeader className="py-3">
+                        <CardTitle className="text-xs font-medium flex items-center gap-1">
+                          <Cpu className="h-4 w-4" /> Pages Cached
+                        </CardTitle>
+                      </CardHeader>
+                      <CardContent className="pb-3">
+                        <div className="text-lg font-semibold">{pagesCount.toLocaleString()}</div>
+                        <div className="text-xs text-muted-foreground">{sources.length} sources</div>
+                      </CardContent>
+                    </Card>
+                    <Card>
+                      <CardHeader className="py-3">
+                        <CardTitle className="text-xs font-medium flex items-center gap-1">
+                          <Network className="h-4 w-4" /> Network (Page)
+                        </CardTitle>
+                      </CardHeader>
+                      <CardContent className="pb-3">
+                        <div className="text-lg font-semibold">{formatBytes(perfTotals.bytes)}</div>
+                        <div className="text-xs text-muted-foreground">{perfTotals.requests} requests</div>
+                      </CardContent>
+                    </Card>
+                    <Card>
+                      <CardHeader className="py-3">
+                        <CardTitle className="text-xs font-medium flex items-center gap-1">
+                          <Activity className="h-4 w-4" /> Worker
+                        </CardTitle>
+                      </CardHeader>
+                      <CardContent className="pb-3">
+                        <div className="text-lg font-semibold">{formatBytes(workerNet.bytes)}</div>
+                        <div className="text-xs text-muted-foreground">{workerNet.requests} requests</div>
+                      </CardContent>
+                    </Card>
+                  </div>
+
+                  <Card>
+                    <CardHeader className="py-3">
+                      <CardTitle className="text-xs font-medium">Cumulative Transfer (Page) Sparkline</CardTitle>
+                    </CardHeader>
+                    <CardContent className="pb-3">
+                      <Sparkline data={netSeries} />
+                      <div className="mt-2 text-xs text-muted-foreground">
+                        Combined: {formatBytes(combinedNetBytes)} across {combinedRequests} requests
+                      </div>
+                    </CardContent>
+                  </Card>
+
+                  <Card>
+                    <CardHeader className="py-3">
+                      <CardTitle className="text-xs font-medium">Requests by type</CardTitle>
+                    </CardHeader>
+                    <CardContent className="pb-3">
+                      <ul className="grid grid-cols-2 gap-1 text-xs">
+                        {Object.entries(perfBreakdown)
+                          .sort((a, b) => b[1] - a[1])
+                          .map(([k, v]) => (
+                            <li key={k} className="flex items-center justify-between">
+                              <span className="capitalize">{k || "other"}</span>
+                              <span className="text-muted-foreground">{v}</span>
+                            </li>
+                          ))}
+                        {Object.keys(perfBreakdown).length === 0 && (
+                          <li className="text-muted-foreground">No resource timing data yet.</li>
+                        )}
+                      </ul>
+                    </CardContent>
+                  </Card>
                 </div>
-              </div>
-            </div>
+              </TabsContent>
+            </Tabs>
           </div>
         </ScrollArea>
       </aside>
@@ -868,7 +1088,7 @@ function Hero({
           priority
         />
         <div className="absolute inset-0 bg-gradient-to-t from-black/50 to-black/10" />
-        <div className="absolute inset-0 flex items-end">
+        <div className="absolute inset-0 flex itemsend">
           <div className="p-6 md:p-10 text-white space-y-4">
             {!online && (
               <span className="rounded bg-amber-500/90 px-2 py-1 text-xs font-medium">Draft</span>
@@ -888,5 +1108,33 @@ function Hero({
       </div>
       <div className="pointer-events-none absolute inset-0 ring-2 ring-violet-500/70" aria-hidden="true" />
     </div>
+  )
+}
+
+function Sparkline({ data = [] as number[] }) {
+  const width = 320
+  const height = 60
+  const padding = 6
+  const pts = data.length
+  const max = Math.max(1, ...data)
+  const min = Math.min(0, ...data)
+  const span = Math.max(1, max - min)
+  const stepX = pts > 1 ? (width - padding * 2) / (pts - 1) : 0
+  const points = data.map((v, i) => {
+    const x = padding + i * stepX
+    // invert y (larger is higher)
+    const y = padding + (1 - (v - min) / span) * (height - padding * 2)
+    return `${x},${y}`
+  }).join(" ")
+  return (
+    <svg width={width} height={height} role="img" aria-label="Network transfer sparkline">
+      <polyline
+        fill="none"
+        stroke="hsl(142, 76%, 36%)"
+        strokeWidth="2"
+        points={points}
+      />
+      <line x1={padding} x2={width - padding} y1={height - padding} y2={height - padding} stroke="hsl(0,0%,85%)" strokeWidth="1" />
+    </svg>
   )
 }

@@ -1,4 +1,5 @@
 let dbPromise: Promise<IDBDatabase> | null = null
+let dbInstance: IDBDatabase | null = null
 
 export type PageRecord = {
   loc: string
@@ -29,7 +30,7 @@ function pathFromLoc(loc: string): string {
 
 export function openDB(): Promise<IDBDatabase> {
   if (dbPromise) return dbPromise
-  // Bump version to 3 to add by_path_lc index and support backfill
+  // Version 3 includes by_path_lc
   dbPromise = new Promise((resolve, reject) => {
     const req = indexedDB.open("visual-editor-db", 3)
     req.onupgradeneeded = () => {
@@ -42,7 +43,6 @@ export function openDB(): Promise<IDBDatabase> {
         pages.createIndex("by_path", "path", { unique: false })
         pages.createIndex("by_path_lc", "path_lc", { unique: false })
       } else {
-        // Upgrade indices if needed
         const tx = req.transaction!
         pages = tx.objectStore("pages")
         if (!pages.indexNames.contains("by_source")) {
@@ -55,12 +55,19 @@ export function openDB(): Promise<IDBDatabase> {
           pages.createIndex("by_path_lc", "path_lc", { unique: false })
         }
       }
-      // Create or ensure "sources" store
       if (!db.objectStoreNames.contains("sources")) {
         db.createObjectStore("sources", { keyPath: "url" })
       }
     }
-    req.onsuccess = () => resolve(req.result)
+    req.onsuccess = () => {
+      dbInstance = req.result
+      dbInstance.onversionchange = () => {
+        try {
+          dbInstance?.close()
+        } catch {}
+      }
+      resolve(req.result)
+    }
     req.onerror = () => reject(req.error)
   })
   return dbPromise
@@ -100,6 +107,17 @@ export async function countBySource(sourceUrl: string): Promise<number> {
   })
 }
 
+export async function countAllPages(): Promise<number> {
+  const db = await openDB()
+  return await new Promise<number>((resolve, reject) => {
+    const tx = db.transaction(["pages"], "readonly")
+    const store = tx.objectStore("pages")
+    const req = store.count()
+    req.onsuccess = () => resolve(req.result || 0)
+    req.onerror = () => reject(req.error)
+  })
+}
+
 export async function getSampleBySource(
   sourceUrl: string,
   limit = 200,
@@ -131,7 +149,6 @@ function normPrefix(raw: string): string {
   const trimmed = raw.trim()
   if (!trimmed) return "/"
   const lead = trimmed.startsWith("/") ? trimmed : `/${trimmed}`
-  // Collapse multiple slashes
   return lead.replace(/\/{2,}/g, "/")
 }
 
@@ -191,8 +208,6 @@ export async function searchFuzzy(raw: string, limit = 10) {
   if (!q) return []
   const prefixResults = await searchByPathPrefixLC(q, limit)
   if (prefixResults.length >= limit) return prefixResults
-  // Only try substring fallback when the input doesn't clearly encode a deep path prefix
-  // or when prefix results are scarce.
   const fallback = await searchBySubstringLC(q, limit - prefixResults.length, 800)
   return [...prefixResults, ...fallback].slice(0, limit)
 }
@@ -258,7 +273,6 @@ async function backfillMissingPaths() {
   })
 }
 
-// Call this once on app load to ensure indices have data.
 export async function ensureBackfillPathsOnce() {
   try {
     const flag = localStorage.getItem("idb:paths-backfilled:v3")
@@ -266,8 +280,33 @@ export async function ensureBackfillPathsOnce() {
     await backfillMissingPaths()
     localStorage.setItem("idb:paths-backfilled:v3", "true")
   } catch {
-    // Ignore storage errors; backfill still ran (or will run again on next load)
+    // ignore
   }
+}
+
+// Danger: nukes the entire DB
+export async function nukeDB(): Promise<void> {
+  try {
+    if (dbInstance) {
+      try {
+        dbInstance.close()
+      } catch {}
+    } else {
+      // Ensure opened once so deleteDatabase works reliably across browsers
+      try {
+        const db = await openDB()
+        db.close()
+      } catch {}
+    }
+  } catch {}
+  await new Promise<void>((resolve, reject) => {
+    const req = indexedDB.deleteDatabase("visual-editor-db")
+    req.onsuccess = () => resolve()
+    req.onerror = () => reject(req.error)
+    req.onblocked = () => resolve() // best effort
+  })
+  dbPromise = null
+  dbInstance = null
 }
 
 // Utilities exported for consumers
