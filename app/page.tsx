@@ -19,7 +19,8 @@ import { BadgeCheck, ChevronDown, Dot, FileText, HelpCircle, ImageIcon, Laptop, 
 import { cn } from "@/lib/utils"
 import type { SourceMeta } from "@/lib/idb"
 import { forceRefresh, listSources, loadFromCache, refreshIfExpired } from "@/lib/sitemap-cache"
-import { importLargeSitemapIndex, type ImportProgress } from "@/lib/large-index-importer"
+import { searchByPathPrefix, type PageRecord } from "@/lib/idb"
+import type { ImportProgress, WorkerToMain } from "@/lib/import-types"
 
 type Device = "desktop" | "tablet" | "mobile"
 
@@ -78,6 +79,15 @@ function prettyNameFromPath(pathname: string): string {
   return decodeURIComponent(last).replace(/[-_]+/g, " ").replace(/\b\w/g, (c) => c.toUpperCase())
 }
 
+function useDebounced<T>(value: T, delay = 250) {
+  const [v, setV] = useState(value)
+  useEffect(() => {
+    const t = setTimeout(() => setV(value), delay)
+    return () => clearTimeout(t)
+  }, [value, delay])
+  return v
+}
+
 export default function Page() {
   const { toast } = useToast()
   const [pages, setPages] = useState<PageMeta[]>(initialPages)
@@ -93,9 +103,20 @@ export default function Page() {
   const [activeSource, setActiveSource] = useState<SourceMeta | null>(null)
   const [sources, setSources] = useState<SourceMeta[]>([])
 
-  // Large index import progress
+  // Worker-driven import progress
   const [progress, setProgress] = useState<ImportProgress | null>(null)
-  const jobRef = useRef<{ cancel: () => void } | null>(null)
+  const workerRef = useRef<Worker | null>(null)
+
+  // Sidebar search (IndexedDB-only)
+  const [sidebarQuery, setSidebarQuery] = useState("")
+  const sidebarSearchToken = useRef(0)
+  const omniSearchToken = useRef(0)
+  const [sidebarResults, setSidebarResults] = useState<PageRecord[] | null>(null)
+
+  // Omnibar quicksearch (relative path prefix)
+  const [omnibarInput, setOmnibarInput] = useState("")
+  const [omniResults, setOmniResults] = useState<PageRecord[]>([])
+  const [showOmniResults, setShowOmniResults] = useState(false)
 
   const selected = useMemo(() => pages.find((p) => p.id === selectedPageId) ?? pages[0], [
     pages,
@@ -123,7 +144,6 @@ export default function Page() {
     setSelectedPageId(id)
   }
 
-  // Merge a sample from IndexedDB into the on-screen list without flooding the UI
   function mergeSampleIntoUI(sample: { loc: string; lastmod?: string }[]) {
     setPages((prev) => {
       const existingPaths = new Set(prev.map((p) => p.path))
@@ -157,24 +177,32 @@ export default function Page() {
     })
   }
 
-  async function refreshSimple(url: string, silent = false) {
-    setIsImporting(true)
-    try {
-      const res = await forceRefresh(url)
-      setActiveSource(res.meta)
-      mergeSampleIntoUI(res.sample)
-      setSources(await listSources())
-      if (!silent) {
-        toast({ title: "Sitemap refreshed", description: `Cached ${res.total.toLocaleString()} URLs.` })
+  function ensurePageFromRecord(rec: PageRecord) {
+    setPages((prev) => {
+      const found = prev.find((p) => p.path === rec.path)
+      if (found) {
+        setSelectedPageId(found.id)
+        return prev
       }
-    } catch (err: any) {
-      toast({ title: "Refresh failed", description: err.message ?? "Unknown error", variant: "destructive" })
-    } finally {
-      setIsImporting(false)
-    }
+      const id = Math.random().toString(36).slice(2, 10)
+      const next: PageMeta = {
+        id,
+        name: prettyNameFromPath(rec.path),
+        path: rec.path,
+        online: true,
+        title: prettyNameFromPath(rec.path),
+        description: "",
+        exclude: false,
+        canonicalUrl: rec.loc,
+        priority: 0.5,
+        lastmod: rec.lastmod,
+      }
+      setSelectedPageId(id)
+      return [...prev, next]
+    })
   }
 
-  // On mount: show cached sample and silently refresh if expired
+  // Cached-first, then silent refresh if expired
   useEffect(() => {
     let cancelled = false
     ;(async () => {
@@ -203,54 +231,135 @@ export default function Page() {
     }
   }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
-  async function startImport(url: string) {
+  // Sidebar search effect (IDB-only)
+  useEffect(() => {
+    let active = true
+    const q = sidebarQuery.trim()
+    const token = ++sidebarSearchToken.current
+    ;(async () => {
+      if (!q) {
+        if (active) setSidebarResults(null)
+        return
+      }
+      try {
+        const results = await searchByPathPrefix(q.startsWith("/") ? q : `/${q}`, 10)
+        if (!active) return
+        if (sidebarSearchToken.current !== token) return
+        setSidebarResults(results)
+      } catch {
+        if (active) setSidebarResults([])
+      }
+    })()
+    return () => {
+      active = false
+    }
+  }, [sidebarQuery])
+
+  // Omnibar quicksearch effect
+  useEffect(() => {
+    const q = omnibarInput
+    const token = ++omniSearchToken.current
+    let mounted = true
+    ;(async () => {
+      const looksLikePath = q.trim().startsWith("/")
+      if (!looksLikePath) {
+        if (mounted) {
+          setOmniResults([])
+          setShowOmniResults(false)
+        }
+        return
+      }
+      const results = await searchByPathPrefix(q.trim(), 10)
+      if (!mounted) return
+      if (omniSearchToken.current !== token) return
+      setOmniResults(results)
+      setShowOmniResults(true)
+    })()
+    return () => {
+      mounted = false
+    }
+  }, [omnibarInput])
+
+  function getWorker(): Worker {
+    if (workerRef.current) return workerRef.current
+    // Use module worker so we can import dependencies
+    const w = new Worker(new URL("../workers/import-worker.ts", import.meta.url), { type: "module" })
+    w.onmessage = (e: MessageEvent<WorkerToMain>) => {
+      const msg = e.data
+      if (msg.type === "start") {
+        setProgress(msg.progress)
+        setIsImporting(true)
+      } else if (msg.type === "progress") {
+        setProgress(msg.progress)
+      } else if (msg.type === "batch") {
+        mergeSampleIntoUI(msg.sample.slice(0, 20))
+      } else if (msg.type === "complete") {
+        setIsImporting(false)
+        setProgress(null)
+        setActiveSource({
+          url: importUrl,
+          lastFetched: Date.now(),
+          expiresAt: Date.now() + 1000 * 60 * 60 * 6,
+          total: msg.total,
+        })
+        ;(async () => setSources(await listSources()))()
+        toast({ title: "Import complete", description: `Cached ${msg.total.toLocaleString()} URLs.` })
+        // Keep the worker for future jobs.
+      } else if (msg.type === "error") {
+        setIsImporting(false)
+        setProgress(null)
+        toast({ title: "Import failed", description: msg.message, variant: "destructive" })
+      }
+    }
+    workerRef.current = w
+    return w
+  }
+
+  async function startImportWithWorker(url: string) {
     setIsImporting(true)
     setProgress(null)
-    // Use the large importer which handles both urlset and index.
-    const job = importLargeSitemapIndex(
-      url,
-      {
-        onStart: (p) => setProgress(p),
-        onProgress: (p) => setProgress(p),
-        onBatch: (batch) => {
-          // Merge a tiny sample to keep the UI engaging without flooding
-          mergeSampleIntoUI(batch.slice(0, 20))
-        },
-        onComplete: async (finalCount) => {
-          setIsImporting(false)
-          setProgress((prev) => (prev ? { ...prev } : prev))
-          setActiveSource({
-            url,
-            lastFetched: Date.now(),
-            expiresAt: Date.now() + 1000 * 60 * 60 * 6,
-            total: finalCount,
-          })
-          setSources(await listSources())
-          toast({
-            title: "Import complete",
-            description: `Cached ${finalCount.toLocaleString()} URLs.`,
-          })
-          jobRef.current = null
-        },
-        onError: (err) => {
-          setIsImporting(false)
-          toast({ title: "Import failed", description: err.message ?? "Unknown error", variant: "destructive" })
-          jobRef.current = null
-        },
-      },
-      {
-        // You can tune these for bigger indexes or slower servers
-        groupSize: 20,
-        concurrency: 4,
+    const w = getWorker()
+    w.postMessage({ type: "start", payload: { url, options: { groupSize: 20, concurrency: 4 } } })
+  }
+
+  function cancelImport() {
+    workerRef.current?.postMessage({ type: "cancel" })
+    setIsImporting(false)
+    setProgress(null)
+    toast({
+      title: "Import canceled",
+      description: "You can resume by clicking Import again.",
+    })
+  }
+
+  async function refreshSimple(url: string, silent = false) {
+    // Fallback refresh via server action; small jobs handled on main thread
+    setIsImporting(true)
+    try {
+      const res = await forceRefresh(url)
+      setActiveSource(res.meta)
+      mergeSampleIntoUI(res.sample)
+      setSources(await listSources())
+      if (!silent) {
+        toast({
+          title: "Sitemap refreshed",
+          description: `Cached ${res.total.toLocaleString()} URLs.`,
+        })
       }
-    )
-    jobRef.current = { cancel: job.cancel }
-    await job.promise
+    } catch (err: any) {
+      toast({
+        title: "Refresh failed",
+        description: err.message ?? "Unknown error",
+        variant: "destructive",
+      })
+    } finally {
+      setIsImporting(false)
+    }
   }
 
   async function handleImportFromSitemap(e?: React.FormEvent) {
     e?.preventDefault()
-    await startImport(importUrl)
+    await startImportWithWorker(importUrl)
   }
 
   const activeIsExpired = activeSource && Date.now() > (activeSource.expiresAt || 0)
@@ -260,6 +369,10 @@ export default function Page() {
       : progress
       ? 0
       : undefined
+
+  useEffect(() => {
+    setOmnibarInput(selected?.canonicalUrl || "")
+  }, [selectedPageId])
 
   return (
     <div className="flex h-dvh w-full bg-background text-foreground">
@@ -283,11 +396,16 @@ export default function Page() {
           </TabsList>
 
           <TabsContent value="pages" className="flex-1 px-3">
-            {/* Search and Add button */}
+            {/* Sidebar search using IDB */}
             <div className="flex items-center gap-3 px-1">
               <div className="relative flex-1">
                 <Search className="absolute left-2 top-2.5 h-4 w-4 text-muted-foreground" />
-                <Input className="pl-8" placeholder="Search pages" />
+                <Input
+                  value={sidebarQuery}
+                  onChange={(e) => setSidebarQuery(e.target.value)}
+                  className="pl-8"
+                  placeholder="Search cached URLs (/products, /blog...)"
+                />
               </div>
               <Button size="icon" onClick={addPage}>
                 <Plus className="h-4 w-4" />
@@ -336,7 +454,6 @@ export default function Page() {
                   </Button>
                 </div>
 
-                {/* Progressive job UI */}
                 {progress && (
                   <div className="space-y-2 rounded-md border p-3">
                     <div className="flex items-center justify-between text-xs">
@@ -351,25 +468,10 @@ export default function Page() {
                       <div className="text-xs text-muted-foreground">
                         {pct !== undefined ? `${pct}%` : "Starting…"}
                       </div>
-                      <div className="flex gap-2">
-                        <Button
-                          type="button"
-                          variant="outline"
-                          size="sm"
-                          onClick={() => {
-                            jobRef.current?.cancel()
-                            setIsImporting(false)
-                            setProgress(null)
-                            toast({
-                              title: "Import canceled",
-                              description: "You can resume by clicking Import again.",
-                            })
-                          }}
-                        >
-                          <Square className="mr-2 h-3.5 w-3.5" />
-                          Cancel
-                        </Button>
-                      </div>
+                      <Button type="button" variant="outline" size="sm" onClick={cancelImport}>
+                        <Square className="mr-2 h-3.5 w-3.5" />
+                        Cancel
+                      </Button>
                     </div>
                   </div>
                 )}
@@ -393,30 +495,52 @@ export default function Page() {
               </div>
             </form>
 
-            <ScrollArea className="mt-4 h-[calc(100dvh-430px)]">
-              <ul className="space-y-1">
-                {pages.map((p) => (
-                  <li key={p.id}>
-                    <button
-                      onClick={() => setSelectedPageId(p.id)}
-                      className={cn(
-                        "w-full flex items-center gap-2 rounded-md px-2 py-2 text-left hover:bg-accent",
-                        p.id === selectedPageId && "bg-accent"
-                      )}
-                      aria-current={p.id === selectedPageId ? "page" : undefined}
-                    >
-                      <span
+            {/* Results or normal list */}
+            <ScrollArea className="mt-4 h-[calc(100dvh-460px)]">
+              {sidebarResults ? (
+                <div className="space-y-2">
+                  <div className="px-1 text-xs text-muted-foreground">
+                    Top 10 results ({sidebarResults.length})
+                  </div>
+                  <ul className="space-y-1">
+                    {sidebarResults.map((r) => (
+                      <li key={r.loc}>
+                        <button
+                          onClick={() => ensurePageFromRecord(r)}
+                          className="w-full rounded-md px-2 py-2 text-left hover:bg-accent"
+                          title={r.loc}
+                        >
+                          <span className="text-xs text-muted-foreground">{r.path}</span>
+                        </button>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              ) : (
+                <ul className="space-y-1">
+                  {pages.map((p) => (
+                    <li key={p.id}>
+                      <button
+                        onClick={() => setSelectedPageId(p.id)}
                         className={cn(
-                          "inline-flex h-2 w-2 rounded-full",
-                          p.online ? "bg-emerald-500" : "bg-muted-foreground"
+                          "w-full flex items-center gap-2 rounded-md px-2 py-2 text-left hover:bg-accent",
+                          p.id === selectedPageId && "bg-accent"
                         )}
-                        aria-hidden="true"
-                      />
-                      <span className="flex-1 truncate">{p.name}</span>
-                    </button>
-                  </li>
-                ))}
-              </ul>
+                        aria-current={p.id === selectedPageId ? "page" : undefined}
+                      >
+                        <span
+                          className={cn(
+                            "inline-flex h-2 w-2 rounded-full",
+                            p.online ? "bg-emerald-500" : "bg-muted-foreground"
+                          )}
+                          aria-hidden="true"
+                        />
+                        <span className="flex-1 truncate">{p.name}</span>
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              )}
             </ScrollArea>
 
             {/* Known sources list */}
@@ -449,11 +573,9 @@ export default function Page() {
                 </Button>
                 <Button variant="ghost" className="justify-start" size="sm">
                   <Settings className="mr-2 h-4 w-4" />
-                  Settings
                 </Button>
                 <Button variant="ghost" className="justify-start" size="sm">
                   <HelpCircle className="mr-2 h-4 w-4" />
-                  Help
                 </Button>
               </div>
             </div>
@@ -482,25 +604,65 @@ export default function Page() {
 
       {/* Main column */}
       <main className="flex min-w-0 flex-1 flex-col">
-        {/* Top bar */}
-        <div className="flex items-center gap-2 border-b p-2">
+        {/* Top bar with omnibar quicksearch */}
+        <div className="relative flex items-center gap-2 border-b p-2">
           <Button variant="ghost" size="icon" className="hidden md:inline-flex h-8 w-8">
             <MousePointer className="h-4 w-4" />
             <span className="sr-only">Select</span>
           </Button>
-          <div className="flex items-center gap-2 min-w-0 flex-1">
+          <div className="relative flex items-center gap-2 min-w-0 flex-1">
             <Badge variant="secondary" className="hidden sm:inline-flex">
               en
             </Badge>
             <div className="relative flex-1 min-w-0">
               <Input
                 className="pl-8"
-                value={selected?.canonicalUrl || "https://example.com"}
-                onChange={(e) => updateSelected("canonicalUrl", e.target.value)}
-                aria-label="Page URL"
+                value={omnibarInput}
+                onChange={(e) => {
+                  const v = e.target.value
+                  setOmnibarInput(v)
+                  if (!v.startsWith("/")) {
+                    updateSelected("canonicalUrl", v)
+                  }
+                }}
+                aria-label="Omnibar"
+                onFocus={() => {
+                  if (omnibarInput.trim().startsWith("/")) setShowOmniResults(true)
+                }}
+                onBlur={() => {
+                  setTimeout(() => setShowOmniResults(false), 150)
+                }}
+                placeholder="Paste a full URL or type /path to quicksearch"
               />
               <Monitor className="absolute left-2 top-2.5 h-4 w-4 text-muted-foreground" />
+
+              {showOmniResults && omniResults.length > 0 && (
+                <div className="absolute z-20 mt-1 w-full rounded-md border bg-popover text-popover-foreground shadow-md">
+                  <ul className="max-h-72 overflow-auto py-1">
+                    {omniResults.map((r) => (
+                      <li key={r.loc}>
+                        <button
+                          className="w-full px-3 py-2 text-left text-sm hover:bg-accent"
+                          onMouseDown={(e) => e.preventDefault()}
+                          onClick={() => {
+                            ensurePageFromRecord(r)
+                            setOmnibarInput(r.loc)
+                            updateSelected("canonicalUrl", r.loc)
+                            setOmniResults([])
+                            setShowOmniResults(false)
+                          }}
+                          title={r.loc}
+                        >
+                          {r.path}
+                          <span className="ml-2 text-xs text-muted-foreground">{r.loc}</span>
+                        </button>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
             </div>
+
             <Select value={device} onValueChange={(v: Device) => setDevice(v)}>
               <SelectTrigger className="w-[120px]">
                 <SelectValue placeholder="Device" />
@@ -527,12 +689,7 @@ export default function Page() {
           <div className="flex items-center gap-2">
             <Button variant="secondary">Preview</Button>
             <Button className="bg-emerald-600 hover:bg-emerald-700">Publish</Button>
-            <Button
-              variant="ghost"
-              size="icon"
-              className="h-8 w-8"
-              onClick={() => setShowReference((s) => !s)}
-            >
+            <Button variant="ghost" size="icon" className="h-8 w-8" onClick={() => setShowReference((s) => !s)}>
               <ImageIcon className="h-4 w-4" />
               <span className="sr-only">Toggle reference</span>
             </Button>
@@ -547,15 +704,11 @@ export default function Page() {
         <div className="relative flex-1 overflow-auto">
           <div className="mx-auto my-6 px-4">
             <Canvas device={device}>
-              <Hero
-                title={selected?.title || ""}
-                description={selected?.description || ""}
-                online={selected?.online || false}
-              />
+              <Hero title={selected?.title || ""} description={selected?.description || ""} online={selected?.online || false} />
             </Canvas>
           </div>
 
-          {/* Vertical tool rail on the left of the canvas */}
+          {/* Vertical tool rail */}
           <div className="pointer-events-none absolute left-2 top-16 hidden xl:block">
             <div className="pointer-events-auto flex flex-col gap-2 rounded-lg border bg-background p-2 shadow-sm">
               <Button variant="ghost" size="icon" className="h-9 w-9" title="Select">
@@ -570,30 +723,6 @@ export default function Page() {
             </div>
           </div>
         </div>
-
-        {/* Optional reference screenshot */}
-        {showReference && (
-          <div className="border-t bg-muted/50">
-            <div className="mx-auto max-w-6xl p-3">
-              <div className="mb-2 flex items-center justify-between">
-                <div className="text-sm font-medium">Reference screenshot</div>
-                <Button size="sm" variant="ghost" onClick={() => setShowReference(false)}>
-                  Hide
-                </Button>
-              </div>
-              <div className="overflow-hidden rounded-md border">
-                <Image
-                  src="/images/reference-editor.png"
-                  alt="Reference mock of a visual editor layout"
-                  width={1600}
-                  height={900}
-                  className="h-auto w-full"
-                  priority
-                />
-              </div>
-            </div>
-          </div>
-        )}
       </main>
 
       {/* Right sidebar */}
