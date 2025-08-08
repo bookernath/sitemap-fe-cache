@@ -13,7 +13,7 @@ import { ScrollArea } from "@/components/ui/scroll-area"
 import { useToast } from "@/hooks/use-toast"
 import { Progress } from "@/components/ui/progress"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
-import { BadgeCheck, ChevronDown, Dot, FileText, HelpCircle, ImageIcon, Laptop, Menu, Monitor, MousePointer, Plus, Search, Settings, Smartphone, Tablet, Type, Loader2, LinkIcon, RefreshCcw, Square, Play, Trash2, Activity, Cpu, Network, Database } from 'lucide-react'
+import { BadgeCheck, ChevronDown, Dot, FileText, HelpCircle, ImageIcon, Laptop, Menu, Monitor, MousePointer, Plus, Search, Settings, Smartphone, Tablet, Type, Loader2, LinkIcon, RefreshCcw, Square, Play, Trash2, Activity, Cpu, Network, Database, BookOpen, Info, Server, HardDrive, Shield, GitBranch, Wand2 } from 'lucide-react'
 import { cn } from "@/lib/utils"
 import type { SourceMeta } from "@/lib/idb"
 import { forceRefresh, listSources, loadFromCache, refreshIfExpired } from "@/lib/sitemap-cache"
@@ -825,6 +825,7 @@ export default function Page() {
                 description={selected?.description || ""}
                 online={selected?.online || false}
               />
+              <DocsPanel />
             </Canvas>
           </div>
 
@@ -1008,6 +1009,128 @@ function Hero({
         </div>
       </div>
       <div className="pointer-events-none absolute inset-0 ring-2 ring-violet-500/70" aria-hidden="true" />
+    </div>
+  )
+}
+
+function DocsPanel() {
+  return (
+    <div className="mt-6">
+      <Card className="border-violet-100">
+        <CardHeader>
+          
+        </CardHeader>
+        <CardContent className="space-y-6 text-sm leading-relaxed">
+          <section className="space-y-2">
+            <div className="flex items-center gap-2 font-semibold">
+              <Wand2 className="h-4 w-4 text-violet-600" />
+              Quick start
+            </div>
+            <ol className="list-decimal pl-5 space-y-1">
+              <li>Paste a sitemap or sitemap index URL in the left panel and click “Import”. Large indexes stream into the cache progressively with live progress.</li>
+              <li>Search your cached URLs:
+                <ul className="list-disc pl-5 mt-1 space-y-1">
+                  <li>Sidebar: type any token or relative path. Results refine on every keystroke (top 10).</li>
+                  <li>Omnibar: type “/path” to search across all known sources. Select a match to set the page.</li>
+                </ul>
+              </li>
+              <li>Use the device selector (Desktop/Tablet/Mobile) to change the preview frame size.</li>
+              <li>Open the right Telemetry panel for DB stats, network, and a “Nuke DB” button to reset.</li>
+            </ol>
+          </section>
+
+          <Separator />
+
+          <section className="grid gap-4 md:grid-cols-2">
+            <div className="rounded-md border p-4">
+              <div className="flex items-center gap-2 font-semibold mb-2">
+                <Server className="h-4 w-4 text-violet-600" />
+                Architecture (high level)
+              </div>
+              <ul className="list-disc pl-5 space-y-1">
+                <li>Next.js App Router UI (client-first demo).</li>
+                <li>Route handlers parse XML sitemaps on the server for CORS safety and speed.</li>
+                <li>Web Worker coordinates large imports (chunks + concurrency) and writes to IndexedDB off the main thread.</li>
+                <li>IndexedDB stores pages: keys by URL; indexes by path and path_lc for instant, case-insensitive prefix search.</li>
+                <li>Client search is API-free; results refine on each keystroke.</li>
+              </ul>
+            </div>
+
+            <div className="rounded-md border p-4">
+              <div className="flex items-center gap-2 font-semibold mb-2">
+                <Database className="h-4 w-4 text-violet-600" />
+                Caching & refresh
+              </div>
+              <ul className="list-disc pl-5 space-y-1">
+                <li>Stale-while-revalidate: cached data loads instantly; background refresh updates samples and counts.</li>
+                <li>Per-source TTL tracked in IndexedDB; sources list lets you swap between known URLs quickly.</li>
+                <li>“Nuke DB” clears the cache and reloads for a clean test slate.</li>
+              </ul>
+            </div>
+
+            <div className="rounded-md border p-4">
+              <div className="flex items-center gap-2 font-semibold mb-2">
+                <Network className="h-4 w-4 text-violet-600" />
+                Telemetry
+              </div>
+              <ul className="list-disc pl-5 space-y-1">
+                <li>DB usage via StorageManager estimate (usage/quota), plus total cached pages and sources.</li>
+                <li>Network details: page resource timings and worker request/byte totals.</li>
+                <li>Sparkline shows transfer trend during the session.</li>
+              </ul>
+            </div>
+
+            <div className="rounded-md border p-4">
+              <div className="flex items-center gap-2 font-semibold mb-2">
+                <Shield className="h-4 w-4 text-violet-600" />
+                Notes & tips
+              </div>
+              <ul className="list-disc pl-5 space-y-1">
+                <li>Everything runs client-side; imports are proxied by server routes only for XML parsing and CORS.</li>
+                <li>Searching is case-insensitive and supports both “/path” prefixes and token substrings.</li>
+                <li>Large imports are chunked and batched to keep the UI responsive.</li>
+              </ul>
+            </div>
+          </section>
+
+          <Separator />
+
+          <section className="space-y-2">
+            <div className="flex items-center gap-2 font-semibold">
+              <GitBranch className="h-4 w-4 text-violet-600" />
+              Key modules
+            </div>
+            <div className="grid md:grid-cols-2 gap-3">
+              <div className="rounded-md border p-3">
+                <div className="font-mono text-xs text-muted-foreground">lib/idb.ts</div>
+                <div className="text-sm">IndexedDB schema, backfill, search (by_path/by_path_lc), and helpers.</div>
+              </div>
+              <div className="rounded-md border p-3">
+                <div className="font-mono text-xs text-muted-foreground">workers/import-worker.ts</div>
+                <div className="text-sm">Concurrent import, chunked writes, progress + telemetry messages.</div>
+              </div>
+              <div className="rounded-md border p-3">
+                <div className="font-mono text-xs text-muted-foreground">app/api/sitemap/*</div>
+                <div className="text-sm">Server routes for parsing sitemap indexes and child sitemaps.</div>
+              </div>
+              <div className="rounded-md border p-3">
+                <div className="font-mono text-xs text-muted-foreground">app/page.tsx</div>
+                <div className="text-sm">UI, omnibar and sidebar search, progress, and telemetry panel.</div>
+              </div>
+            </div>
+          </section>
+
+          <Separator />
+
+          <section className="space-y-2">
+            <div className="flex items-center gap-2 font-semibold">
+              <Info className="h-4 w-4 text-violet-600" />
+              Resetting for tests
+            </div>
+            <p>Use the “Nuke DB” button in the Telemetry panel (right) to clear IndexedDB and reload the app with a clean slate.</p>
+          </section>
+        </CardContent>
+      </Card>
     </div>
   )
 }
